@@ -1,5 +1,6 @@
 import html
 import io
+import json
 import os
 import re
 import subprocess
@@ -81,7 +82,11 @@ def parse_drive_view_metadata(drive_url: str) -> tuple[str, int | None, str, str
     raw_html = fetch_text(view_url)
 
     title_match = re.search(r"<title>(.*?)</title>", raw_html, flags=re.IGNORECASE | re.DOTALL)
-    title = html.unescape(title_match.group(1)).replace(" - Google 雲端硬碟", "").strip() if title_match else file_id
+    if title_match:
+        title_raw = html.unescape(title_match.group(1)).strip()
+        title = re.sub(r"\s*-\s*Google\s*(雲端硬碟|Drive)\s*$", "", title_raw, flags=re.IGNORECASE)
+    else:
+        title = file_id
 
     page_matches = re.findall(r"共\s*(\d+)\s*頁", raw_html)
     total_pages = max(int(x) for x in page_matches) if page_matches else None
@@ -99,10 +104,41 @@ def parse_drive_view_metadata(drive_url: str) -> tuple[str, int | None, str, str
     dsmi = upload_query.get("dsmi", ["texmex"])[0]
 
     upload_resp = fetch_text(upload_url)
-    token_match = re.search(r"ACFr[0-9A-Za-z\-_=%%]+", upload_resp)
-    if not token_match:
-        raise RuntimeError("無法從 viewer/upload 回應中取得圖像 token。")
-    token = token_match.group(0)
+    upload_json_text = upload_resp[5:] if upload_resp.startswith(")]}'") else upload_resp
+    try:
+        upload_data = json.loads(upload_json_text)
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f"viewer/upload 回應解析失敗: {err}") from err
+
+    page_path = str(upload_data.get("page", "")).strip()
+    if not page_path:
+        raise RuntimeError("viewer/upload 回應缺少 page 路徑。")
+
+    page_url = urllib.parse.urljoin("https://drive.google.com/viewer/", page_path)
+    page_query = urllib.parse.parse_qs(urllib.parse.urlparse(page_url).query)
+
+    token = page_query.get("id", [""])[0]
+    if not token:
+        raise RuntimeError("無法從 viewer/page 路徑取得圖像 token。")
+
+    dsmi_from_page = page_query.get("dsmi", [""])[0]
+    if dsmi_from_page:
+        dsmi = dsmi_from_page
+
+    if total_pages is None:
+        meta_path = str(upload_data.get("meta", "")).strip()
+        if meta_path:
+            meta_url = urllib.parse.urljoin("https://drive.google.com/viewer/", meta_path)
+            meta_resp = fetch_text(meta_url)
+            meta_json_text = meta_resp[5:] if meta_resp.startswith(")]}'") else meta_resp
+            try:
+                meta_data = json.loads(meta_json_text)
+                pages = meta_data.get("pages")
+                if isinstance(pages, int) and pages > 0:
+                    total_pages = pages
+            except json.JSONDecodeError:
+                # Fallback to runtime detection when meta payload is not JSON.
+                pass
 
     return title, total_pages, token, dsmi
 
