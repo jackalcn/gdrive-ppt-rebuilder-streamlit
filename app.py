@@ -10,6 +10,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import mkdtemp
+from urllib.error import HTTPError
 
 import streamlit as st
 from PIL import Image
@@ -73,7 +74,7 @@ def fetch_text(url: str, timeout: int = 45) -> str:
         return resp.read().decode("utf-8", "ignore")
 
 
-def parse_drive_view_metadata(drive_url: str) -> tuple[str, int, str, str]:
+def parse_drive_view_metadata(drive_url: str) -> tuple[str, int | None, str, str]:
     file_id = extract_file_id(drive_url)
     view_url = f"https://drive.google.com/file/d/{file_id}/view"
 
@@ -83,9 +84,7 @@ def parse_drive_view_metadata(drive_url: str) -> tuple[str, int, str, str]:
     title = html.unescape(title_match.group(1)).replace(" - Google 雲端硬碟", "").strip() if title_match else file_id
 
     page_matches = re.findall(r"共\s*(\d+)\s*頁", raw_html)
-    if not page_matches:
-        raise RuntimeError("無法解析總頁數，請確認檔案可公開檢視。")
-    total_pages = max(int(x) for x in page_matches)
+    total_pages = max(int(x) for x in page_matches) if page_matches else None
 
     upload_match = re.search(r"viewer/upload\?([^\"']+)", raw_html)
     if not upload_match:
@@ -108,48 +107,121 @@ def parse_drive_view_metadata(drive_url: str) -> tuple[str, int, str, str]:
     return title, total_pages, token, dsmi
 
 
+def build_viewer_img_url(token: str, dsmi: str, page: int, image_width: int) -> str:
+    params = {
+        "id": token,
+        "dsmi": dsmi,
+        "auditContext": "forDisplay",
+        "page": str(page),
+        "skiphighlight": "true",
+        "w": str(image_width),
+        "webp": "true",
+    }
+    return "https://drive.google.com/viewer/img?" + urllib.parse.urlencode(params)
+
+
+def fetch_slide_image_bytes(
+    token: str,
+    dsmi: str,
+    page: int,
+    image_width: int,
+    retries: int,
+) -> bytes | None:
+    url = build_viewer_img_url(token=token, dsmi=dsmi, page=page, image_width=image_width)
+    last_err = ""
+
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return resp.read()
+        except HTTPError as err:
+            if err.code in (400, 404):
+                return None
+            last_err = f"HTTP {err.code}"
+        except Exception as err:  # noqa: BLE001
+            last_err = str(err)
+
+        time.sleep(0.6 * attempt)
+
+    raise RuntimeError(f"第 {page + 1} 頁下載失敗: {last_err}")
+
+
+def detect_total_pages(token: str, dsmi: str, retries: int) -> int:
+    probe_width = 64
+    first_page = fetch_slide_image_bytes(
+        token=token,
+        dsmi=dsmi,
+        page=0,
+        image_width=probe_width,
+        retries=retries,
+    )
+    if first_page is None:
+        raise RuntimeError("無法下載第 1 頁，請確認檔案可公開檢視。")
+
+    low = 0
+    high = 1
+    while True:
+        data = fetch_slide_image_bytes(
+            token=token,
+            dsmi=dsmi,
+            page=high,
+            image_width=probe_width,
+            retries=retries,
+        )
+        if data is None:
+            break
+        low = high
+        high *= 2
+        if high > 4096:
+            raise RuntimeError("頁數偵測超出安全上限，請確認來源檔案是否正常。")
+
+    while low + 1 < high:
+        mid = (low + high) // 2
+        data = fetch_slide_image_bytes(
+            token=token,
+            dsmi=dsmi,
+            page=mid,
+            image_width=probe_width,
+            retries=retries,
+        )
+        if data is None:
+            high = mid
+        else:
+            low = mid
+
+    return low + 1
+
+
 def download_slide_images(
     token: str,
     dsmi: str,
-    total_pages: int,
+    total_pages: int | None,
     image_width: int,
     retries: int,
     output_dir: Path,
     log,
     update_progress,
-) -> tuple[list[Path], tuple[int, int]]:
+) -> tuple[list[Path], tuple[int, int], int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     image_paths: list[Path] = []
     size_set: set[tuple[int, int]] = set()
 
-    base = "https://drive.google.com/viewer/img"
+    if total_pages is None:
+        log("未提供總頁數，系統改用 API 自動偵測頁數。")
+        total_pages = detect_total_pages(token=token, dsmi=dsmi, retries=retries)
+        log(f"頁數偵測完成：共 {total_pages} 頁")
 
     for idx in range(total_pages):
-        params = {
-            "id": token,
-            "dsmi": dsmi,
-            "auditContext": "forDisplay",
-            "page": str(idx),
-            "skiphighlight": "true",
-            "w": str(image_width),
-            "webp": "true",
-        }
-        url = base + "?" + urllib.parse.urlencode(params)
-
-        data = None
-        last_err = ""
-        for attempt in range(1, retries + 1):
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=45) as resp:
-                    data = resp.read()
-                break
-            except Exception as err:  # noqa: BLE001
-                last_err = str(err)
-                time.sleep(0.6 * attempt)
-
+        data = fetch_slide_image_bytes(
+            token=token,
+            dsmi=dsmi,
+            page=idx,
+            image_width=image_width,
+            retries=retries,
+        )
         if data is None:
-            raise RuntimeError(f"第 {idx + 1} 頁下載失敗: {last_err}")
+            raise RuntimeError(f"第 {idx + 1} 頁回傳空內容，可能為頁數解析異常。")
 
         image = Image.open(io.BytesIO(data)).convert("RGB")
         size_set.add(image.size)
@@ -164,7 +236,7 @@ def download_slide_images(
     if len(size_set) != 1:
         raise RuntimeError(f"下載頁面尺寸不一致: {sorted(size_set)}")
 
-    return image_paths, next(iter(size_set))
+    return image_paths, next(iter(size_set)), total_pages
 
 
 def build_pptx_from_images(
@@ -408,7 +480,8 @@ if run_mode:
                 status_box.info(f"({idx}/{len(links)}) 系統正在解析連結資訊。")
                 add_log(f"[{idx}/{len(links)}] 開始解析 Drive 連結")
                 title, total_pages, token, dsmi = parse_drive_view_metadata(link)
-                add_log(f"[{idx}/{len(links)}] 解析完成：標題={title}，頁數={total_pages}")
+                page_text = str(total_pages) if total_pages is not None else "自動偵測"
+                add_log(f"[{idx}/{len(links)}] 解析完成：標題={title}，頁數={page_text}")
 
                 output_name = build_output_name(naming_mode, title, custom_name)
                 temp_root = Path(mkdtemp(prefix="drive_ppt_"))
@@ -416,7 +489,7 @@ if run_mode:
                 output_file = temp_root / output_name
 
                 status_box.info(f"({idx}/{len(links)}) 系統正在下載投影片頁面。")
-                image_paths, size = download_slide_images(
+                image_paths, size, resolved_pages = download_slide_images(
                     token=token,
                     dsmi=dsmi,
                     total_pages=total_pages,
@@ -449,7 +522,7 @@ if run_mode:
                         "狀態": "成功",
                         "標題": title,
                         "輸出檔名": final_file.name,
-                        "頁數": str(total_pages),
+                        "頁數": str(resolved_pages),
                         "尺寸": f"{size[0]} x {size[1]}",
                         "檔案大小MB": f"{len(pptx_bytes) / 1024 / 1024:.2f}",
                         "訊息": "完成",
