@@ -349,16 +349,23 @@ def build_pdf_from_images(
             img.close()
 
 
-def build_output_name(naming_mode: str, title: str, custom_name: str, output_format: str) -> str:
-    ext = ".pdf" if output_format == "PDF" else ".pptx"
+def build_output_base_name(naming_mode: str, title: str, custom_name: str) -> str:
     if naming_mode == "沿用原始檔名":
-        return sanitize_filename(title) + ext
+        return sanitize_filename(title)
     if naming_mode == "原始檔名加日期":
         ts = datetime.now().strftime("%Y%m%d")
-        return sanitize_filename(f"{title}_{ts}") + ext
+        return sanitize_filename(f"{title}_{ts}")
     if not custom_name.strip():
         raise ValueError("請輸入自訂檔名。")
-    return sanitize_filename(custom_name.strip()) + ext
+    return sanitize_filename(custom_name.strip())
+
+
+def build_output_plan(output_format: str, base_name: str) -> list[tuple[str, str]]:
+    if output_format == "PPTX + PDF":
+        return [("PPTX", f"{base_name}.pptx"), ("PDF", f"{base_name}.pdf")]
+    if output_format == "PDF":
+        return [("PDF", f"{base_name}.pdf")]
+    return [("PPTX", f"{base_name}.pptx")]
 
 
 def collect_input_links(mode: str, drive_url: str, batch_links_text: str) -> list[str]:
@@ -458,7 +465,7 @@ with st.sidebar:
         )
     naming_mode = st.radio("輸出檔名規則", ["沿用原始檔名", "原始檔名加日期", "自訂名稱"], index=0)
     custom_name = st.text_input("自訂檔名", value="") if naming_mode == "自訂名稱" else ""
-    output_format = st.selectbox("輸出格式", ["PPTX", "PDF"], index=0)
+    output_format = st.selectbox("輸出格式", ["PPTX", "PDF", "PPTX + PDF"], index=0)
     image_width = st.selectbox("圖片寬度", [1600, 1920, 1280], index=0)
     retries = st.slider("重試次數", 1, 5, 3)
     save_local = st.checkbox("另存至伺服器工作目錄", value=True)
@@ -624,10 +631,10 @@ if run_mode:
                     page_text = str(total_pages) if total_pages is not None else "自動偵測"
                     add_log(f"[{idx}/{len(links)}] 解析完成：標題={title}，頁數={page_text}")
 
-                    output_name = build_output_name(naming_mode, title, custom_name, output_format)
+                    base_name = build_output_base_name(naming_mode, title, custom_name)
+                    output_plan = build_output_plan(output_format=output_format, base_name=base_name)
                     temp_root = Path(mkdtemp(prefix="drive_ppt_"))
                     image_dir = temp_root / "slides"
-                    output_file = temp_root / output_name
 
                     status_box.info(f"({idx}/{len(links)}) 系統正在下載投影片頁面。")
                     image_paths, size, resolved_pages = download_slide_images(
@@ -643,53 +650,61 @@ if run_mode:
                         ),
                     )
 
-                    status_box.info(f"({idx}/{len(links)}) 系統正在重建 {output_format}。")
-                    if output_format == "PDF":
-                        final_file = build_pdf_from_images(
-                            image_paths=image_paths,
-                            output_path=output_file,
-                            log=add_log,
-                            update_progress=lambda done, total: build_progress.progress(
-                                int(done * 100 / total), text=f"建檔進度: {done}/{total}"
-                            ),
-                        )
-                    else:
-                        final_file = build_pptx_from_images(
-                            image_paths=image_paths,
-                            size=size,
-                            output_path=output_file,
-                            log=add_log,
-                            update_progress=lambda done, total: build_progress.progress(
-                                int(done * 100 / total), text=f"建檔進度: {done}/{total}"
-                            ),
-                        )
+                    generated_files: list[tuple[Path, bytes, str]] = []
+                    for out_idx, (fmt, filename) in enumerate(output_plan, 1):
+                        output_file = temp_root / filename
+                        status_box.info(f"({idx}/{len(links)}) 系統正在重建 {fmt} ({out_idx}/{len(output_plan)})。")
 
-                    file_bytes = final_file.read_bytes()
-                    artifacts.append((final_file.name, file_bytes))
+                        if fmt == "PDF":
+                            final_file = build_pdf_from_images(
+                                image_paths=image_paths,
+                                output_path=output_file,
+                                log=add_log,
+                                update_progress=lambda done, total: build_progress.progress(
+                                    int(done * 100 / total), text=f"建檔進度: {done}/{total}"
+                                ),
+                            )
+                        else:
+                            final_file = build_pptx_from_images(
+                                image_paths=image_paths,
+                                size=size,
+                                output_path=output_file,
+                                log=add_log,
+                                update_progress=lambda done, total: build_progress.progress(
+                                    int(done * 100 / total), text=f"建檔進度: {done}/{total}"
+                                ),
+                            )
+
+                        file_bytes = final_file.read_bytes()
+                        artifacts.append((final_file.name, file_bytes))
+                        generated_files.append((final_file, file_bytes, fmt))
+
+                        if save_local:
+                            local_path = Path.cwd() / final_file.name
+                            try:
+                                local_path.write_bytes(file_bytes)
+                                add_log(f"已另存至：{local_path}")
+                            except PermissionError:
+                                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                fallback = Path.cwd() / f"{Path(final_file.name).stem}_fixed_{ts}{final_file.suffix}"
+                                fallback.write_bytes(file_bytes)
+                                add_log(f"原檔被占用，已另存為：{fallback}")
+
                     success_count += 1
 
+                    file_name_text = " | ".join(f.name for f, _, _ in generated_files)
+                    size_text = "; ".join(f"{fmt}:{len(data) / 1024 / 1024:.2f}" for _, data, fmt in generated_files)
                     row.update(
                         {
                             "狀態": "成功",
                             "標題": title,
-                            "輸出檔名": final_file.name,
+                            "輸出檔名": file_name_text,
                             "頁數": str(resolved_pages),
                             "尺寸": f"{size[0]} x {size[1]}",
-                            "檔案大小MB": f"{len(file_bytes) / 1024 / 1024:.2f}",
+                            "檔案大小MB": size_text,
                             "訊息": "完成",
                         }
                     )
-
-                    if save_local:
-                        local_path = Path.cwd() / final_file.name
-                        try:
-                            local_path.write_bytes(file_bytes)
-                            add_log(f"已另存至：{local_path}")
-                        except PermissionError:
-                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            fallback = Path.cwd() / f"{Path(final_file.name).stem}_fixed_{ts}{final_file.suffix}"
-                            fallback.write_bytes(file_bytes)
-                            add_log(f"原檔被占用，已另存為：{fallback}")
 
                 except Exception as err:  # noqa: BLE001
                     row["訊息"] = str(err)
@@ -721,7 +736,8 @@ if run_mode:
                 )
             elif len(artifacts) > 1:
                 zip_bytes = bundle_zip_bytes(artifacts)
-                zip_name = f"drive_batch_{output_format.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                format_slug = output_format.lower().replace(" ", "").replace("+", "plus")
+                zip_name = f"drive_batch_{format_slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
                 st.download_button(
                     label="下載批次成果 ZIP",
                     data=zip_bytes,
