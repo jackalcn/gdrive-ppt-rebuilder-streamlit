@@ -1,0 +1,28 @@
+name: Streamlit Cloud Redeploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Redeploy reason (optional)
+        required: false
+        default: Manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trigger Streamlit redeploy with empty commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          reason="${{ github.event.inputs.reason }}"
+          git commit --allow-empty -m "chore: trigger streamlit redeploy ${ts} ${reason}"
+          git push

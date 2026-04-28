@@ -5,7 +5,7 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import mkdtemp
 
@@ -15,6 +15,18 @@ from pptx import Presentation
 
 PIXEL_TO_EMU = 9525
 USER_AGENT = "Mozilla/5.0"
+APP_VERSION = "v1.1.0"
+APP_REPO = "jackalcn/gdrive-ppt-rebuilder-streamlit"
+TW_TZ = timezone(timedelta(hours=8))
+
+
+def get_release_summary() -> tuple[str, str]:
+    try:
+        updated_at = datetime.fromtimestamp(Path(__file__).stat().st_mtime, tz=TW_TZ)
+        updated_text = updated_at.strftime("%Y-%m-%d %H:%M (UTC+8)")
+    except OSError:
+        updated_text = "未知"
+    return APP_VERSION, updated_text
 
 
 def sanitize_filename(name: str) -> str:
@@ -248,6 +260,11 @@ html, body, [class*="css"] { font-family: 'Noto Sans TC', sans-serif; }
 
 st.title("Google Drive 簡報轉換平台")
 st.caption("專業公務風 | 公開可檢視連結轉換為 PPTX")
+app_version, app_updated_at = get_release_summary()
+st.markdown(
+    f"<div class='small-note'>版本：{app_version}｜最後更新：{app_updated_at}</div>",
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.subheader("任務設定")
@@ -270,6 +287,14 @@ with st.sidebar:
     start = st.button("開始轉換", type="primary", use_container_width=True)
     retry_failed = st.button("重試失敗項目", use_container_width=True)
     clear_history = st.button("清除任務歷程", use_container_width=True)
+    st.markdown("---")
+    st.caption("部署維運")
+    st.markdown("推送到 `main` 分支會自動部署，也可按下方連結手動觸發 redeploy。")
+    st.link_button(
+        "一鍵重新部署（GitHub Actions）",
+        f"https://github.com/{APP_REPO}/actions/workflows/streamlit-cloud-redeploy.yml",
+        use_container_width=True,
+    )
 
 step_col1, step_col2, step_col3, step_col4 = st.columns(4)
 step_col1.markdown("<div class='gov-kpi'>1. 解析連結</div>", unsafe_allow_html=True)
