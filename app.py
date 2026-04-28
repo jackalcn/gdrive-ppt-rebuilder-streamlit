@@ -314,15 +314,57 @@ def build_pptx_from_images(
         return fallback
 
 
-def build_output_name(naming_mode: str, title: str, custom_name: str) -> str:
+def build_pdf_from_images(
+    image_paths: list[Path],
+    output_path: Path,
+    log,
+    update_progress,
+) -> Path:
+    pil_images: list[Image.Image] = []
+    total = len(image_paths)
+
+    try:
+        for idx, image_path in enumerate(image_paths, 1):
+            pil_images.append(Image.open(image_path).convert("RGB"))
+            update_progress(idx, total)
+            if idx % 5 == 0 or idx == total:
+                log(f"已準備 PDF 頁面 {idx}/{total}")
+
+        if not pil_images:
+            raise RuntimeError("沒有可用影像可輸出 PDF。")
+
+        first = pil_images[0]
+        rest = pil_images[1:]
+        try:
+            first.save(str(output_path), "PDF", save_all=True, append_images=rest)
+            return output_path
+        except PermissionError:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fallback = output_path.with_stem(output_path.stem + f"_fixed_{ts}")
+            first.save(str(fallback), "PDF", save_all=True, append_images=rest)
+            log(f"原檔被占用，已改存為: {fallback.name}")
+            return fallback
+    finally:
+        for img in pil_images:
+            img.close()
+
+
+def build_output_name(naming_mode: str, title: str, custom_name: str, output_format: str) -> str:
+    ext = ".pdf" if output_format == "PDF" else ".pptx"
     if naming_mode == "沿用原始檔名":
-        return sanitize_filename(title) + ".pptx"
+        return sanitize_filename(title) + ext
     if naming_mode == "原始檔名加日期":
         ts = datetime.now().strftime("%Y%m%d")
-        return sanitize_filename(f"{title}_{ts}") + ".pptx"
+        return sanitize_filename(f"{title}_{ts}") + ext
     if not custom_name.strip():
         raise ValueError("請輸入自訂檔名。")
-    return sanitize_filename(custom_name.strip()) + ".pptx"
+    return sanitize_filename(custom_name.strip()) + ext
+
+
+def collect_input_links(mode: str, drive_url: str, batch_links_text: str) -> list[str]:
+    if mode == "單一連結":
+        return [drive_url.strip()] if drive_url.strip() else []
+    return [x.strip() for x in batch_links_text.splitlines() if x.strip()]
 
 
 def history_to_csv_bytes(records: list[dict]) -> bytes:
@@ -393,7 +435,7 @@ html, body, [class*="css"] { font-family: 'Noto Sans TC', sans-serif; }
 )
 
 st.title("Google Drive 簡報轉換平台")
-st.caption("專業公務風 | 公開可檢視連結轉換為 PPTX")
+st.caption("專業公務風 | 公開可檢視連結轉換為 PPTX 或 PDF")
 app_version, app_updated_at = get_release_summary()
 deploy_commit = get_deploy_commit_short()
 st.markdown(
@@ -416,10 +458,12 @@ with st.sidebar:
         )
     naming_mode = st.radio("輸出檔名規則", ["沿用原始檔名", "原始檔名加日期", "自訂名稱"], index=0)
     custom_name = st.text_input("自訂檔名", value="") if naming_mode == "自訂名稱" else ""
+    output_format = st.selectbox("輸出格式", ["PPTX", "PDF"], index=0)
     image_width = st.selectbox("圖片寬度", [1600, 1920, 1280], index=0)
     retries = st.slider("重試次數", 1, 5, 3)
     save_local = st.checkbox("另存至伺服器工作目錄", value=True)
     start = st.button("開始轉換", type="primary", use_container_width=True)
+    check_links = st.button("連結健康檢查", use_container_width=True)
     retry_failed = st.button("重試失敗項目", use_container_width=True)
     clear_history = st.button("清除任務歷程", use_container_width=True)
     st.markdown("---")
@@ -446,9 +490,12 @@ if "logs" not in st.session_state:
     st.session_state.logs = []
 if "history" not in st.session_state:
     st.session_state.history = []
+if "link_checks" not in st.session_state:
+    st.session_state.link_checks = []
 
 if clear_history:
     st.session_state.history = []
+    st.session_state.link_checks = []
 
 
 def add_log(message: str) -> None:
@@ -460,6 +507,8 @@ def add_log(message: str) -> None:
 run_mode = None
 if start:
     run_mode = "start"
+elif check_links:
+    run_mode = "check"
 elif retry_failed:
     run_mode = "retry"
 
@@ -470,16 +519,71 @@ if run_mode:
     build_progress.progress(0, text="建檔進度: 0%")
 
     try:
-        if run_mode == "start":
-            if mode == "單一連結":
-                links = [drive_url.strip()] if drive_url.strip() else []
-            else:
-                links = [x.strip() for x in batch_links_text.splitlines() if x.strip()]
-
+        if run_mode == "check":
+            links = collect_input_links(mode=mode, drive_url=drive_url, batch_links_text=batch_links_text)
             if not links:
                 raise ValueError("請至少輸入一個 Google Drive 連結。")
 
-            operation_name = "批次作業"
+            check_results: list[dict] = []
+            ok_count = 0
+
+            for idx, link in enumerate(links, 1):
+                status_box.info(f"({idx}/{len(links)}) 系統正在進行連結健康檢查。")
+                add_log(f"[{idx}/{len(links)}] 健康檢查開始")
+
+                row = {
+                    "時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "狀態": "異常",
+                    "來源連結": link,
+                    "標題": "",
+                    "頁數": "",
+                    "訊息": "",
+                }
+
+                try:
+                    title, total_pages, token, dsmi = parse_drive_view_metadata(link)
+                    resolved_pages = total_pages if total_pages is not None else detect_total_pages(token, dsmi, retries)
+                    first_page = fetch_slide_image_bytes(
+                        token=token,
+                        dsmi=dsmi,
+                        page=0,
+                        image_width=max(256, image_width),
+                        retries=retries,
+                    )
+                    if first_page is None:
+                        raise RuntimeError("第一頁下載驗證失敗。")
+
+                    row.update(
+                        {
+                            "狀態": "可用",
+                            "標題": title,
+                            "頁數": str(resolved_pages),
+                            "訊息": "可正常解析與下載",
+                        }
+                    )
+                    ok_count += 1
+                    add_log(f"[{idx}/{len(links)}] 健康檢查通過：{title} / {resolved_pages} 頁")
+                except Exception as err:  # noqa: BLE001
+                    row["訊息"] = str(err)
+                    add_log(f"[{idx}/{len(links)}] 健康檢查失敗：{err}")
+
+                check_results.append(row)
+
+            st.session_state.link_checks = check_results
+
+            if ok_count == len(links):
+                status_box.success(f"健康檢查完成：{ok_count}/{len(links)} 可用。")
+            elif ok_count > 0:
+                status_box.warning(f"健康檢查完成：{ok_count}/{len(links)} 可用，請檢查異常連結。")
+            else:
+                status_box.error("健康檢查完成：全部連結異常。")
+
+        elif run_mode == "start":
+            links = collect_input_links(mode=mode, drive_url=drive_url, batch_links_text=batch_links_text)
+            if not links:
+                raise ValueError("請至少輸入一個 Google Drive 連結。")
+
+            operation_name = "轉換作業"
         else:
             links = []
             seen = set()
@@ -497,117 +601,134 @@ if run_mode:
             add_log(f"啟動失敗項目重試，共 {len(links)} 筆")
             operation_name = "重試作業"
 
-        artifacts: list[tuple[str, bytes]] = []
-        success_count = 0
+        if run_mode != "check":
+            artifacts: list[tuple[str, bytes]] = []
+            success_count = 0
 
-        for idx, link in enumerate(links, 1):
-            row = {
-                "時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "狀態": "失敗",
-                "來源連結": link,
-                "標題": "",
-                "輸出檔名": "",
-                "頁數": "",
-                "尺寸": "",
-                "檔案大小MB": "",
-                "訊息": "",
-            }
-            try:
-                status_box.info(f"({idx}/{len(links)}) 系統正在解析連結資訊。")
-                add_log(f"[{idx}/{len(links)}] 開始解析 Drive 連結")
-                title, total_pages, token, dsmi = parse_drive_view_metadata(link)
-                page_text = str(total_pages) if total_pages is not None else "自動偵測"
-                add_log(f"[{idx}/{len(links)}] 解析完成：標題={title}，頁數={page_text}")
+            for idx, link in enumerate(links, 1):
+                row = {
+                    "時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "狀態": "失敗",
+                    "來源連結": link,
+                    "標題": "",
+                    "輸出檔名": "",
+                    "頁數": "",
+                    "尺寸": "",
+                    "檔案大小MB": "",
+                    "訊息": "",
+                }
+                try:
+                    status_box.info(f"({idx}/{len(links)}) 系統正在解析連結資訊。")
+                    add_log(f"[{idx}/{len(links)}] 開始解析 Drive 連結")
+                    title, total_pages, token, dsmi = parse_drive_view_metadata(link)
+                    page_text = str(total_pages) if total_pages is not None else "自動偵測"
+                    add_log(f"[{idx}/{len(links)}] 解析完成：標題={title}，頁數={page_text}")
 
-                output_name = build_output_name(naming_mode, title, custom_name)
-                temp_root = Path(mkdtemp(prefix="drive_ppt_"))
-                image_dir = temp_root / "slides"
-                output_file = temp_root / output_name
+                    output_name = build_output_name(naming_mode, title, custom_name, output_format)
+                    temp_root = Path(mkdtemp(prefix="drive_ppt_"))
+                    image_dir = temp_root / "slides"
+                    output_file = temp_root / output_name
 
-                status_box.info(f"({idx}/{len(links)}) 系統正在下載投影片頁面。")
-                image_paths, size, resolved_pages = download_slide_images(
-                    token=token,
-                    dsmi=dsmi,
-                    total_pages=total_pages,
-                    image_width=image_width,
-                    retries=retries,
-                    output_dir=image_dir,
-                    log=add_log,
-                    update_progress=lambda done, total: download_progress.progress(
-                        int(done * 100 / total), text=f"下載進度: {done}/{total}"
-                    ),
+                    status_box.info(f"({idx}/{len(links)}) 系統正在下載投影片頁面。")
+                    image_paths, size, resolved_pages = download_slide_images(
+                        token=token,
+                        dsmi=dsmi,
+                        total_pages=total_pages,
+                        image_width=image_width,
+                        retries=retries,
+                        output_dir=image_dir,
+                        log=add_log,
+                        update_progress=lambda done, total: download_progress.progress(
+                            int(done * 100 / total), text=f"下載進度: {done}/{total}"
+                        ),
+                    )
+
+                    status_box.info(f"({idx}/{len(links)}) 系統正在重建 {output_format}。")
+                    if output_format == "PDF":
+                        final_file = build_pdf_from_images(
+                            image_paths=image_paths,
+                            output_path=output_file,
+                            log=add_log,
+                            update_progress=lambda done, total: build_progress.progress(
+                                int(done * 100 / total), text=f"建檔進度: {done}/{total}"
+                            ),
+                        )
+                    else:
+                        final_file = build_pptx_from_images(
+                            image_paths=image_paths,
+                            size=size,
+                            output_path=output_file,
+                            log=add_log,
+                            update_progress=lambda done, total: build_progress.progress(
+                                int(done * 100 / total), text=f"建檔進度: {done}/{total}"
+                            ),
+                        )
+
+                    file_bytes = final_file.read_bytes()
+                    artifacts.append((final_file.name, file_bytes))
+                    success_count += 1
+
+                    row.update(
+                        {
+                            "狀態": "成功",
+                            "標題": title,
+                            "輸出檔名": final_file.name,
+                            "頁數": str(resolved_pages),
+                            "尺寸": f"{size[0]} x {size[1]}",
+                            "檔案大小MB": f"{len(file_bytes) / 1024 / 1024:.2f}",
+                            "訊息": "完成",
+                        }
+                    )
+
+                    if save_local:
+                        local_path = Path.cwd() / final_file.name
+                        try:
+                            local_path.write_bytes(file_bytes)
+                            add_log(f"已另存至：{local_path}")
+                        except PermissionError:
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            fallback = Path.cwd() / f"{Path(final_file.name).stem}_fixed_{ts}{final_file.suffix}"
+                            fallback.write_bytes(file_bytes)
+                            add_log(f"原檔被占用，已另存為：{fallback}")
+
+                except Exception as err:  # noqa: BLE001
+                    row["訊息"] = str(err)
+                    add_log(f"[{idx}/{len(links)}] 錯誤：{err}")
+
+                st.session_state.history.append(row)
+
+            if success_count == len(links):
+                status_box.success(f"{operation_name}完成：{success_count}/{len(links)} 成功。")
+            elif success_count > 0:
+                status_box.warning(f"{operation_name}完成：{success_count}/{len(links)} 成功，請檢查失敗項目。")
+            else:
+                status_box.error("作業未完成：全部連結皆失敗。")
+
+            if len(artifacts) == 1:
+                fname, data = artifacts[0]
+                if fname.lower().endswith(".pdf"):
+                    label = "下載轉換後 PDF"
+                    mime = "application/pdf"
+                else:
+                    label = "下載轉換後 PPTX"
+                    mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                st.download_button(
+                    label=label,
+                    data=data,
+                    file_name=fname,
+                    mime=mime,
+                    use_container_width=True,
                 )
-
-                status_box.info(f"({idx}/{len(links)}) 系統正在重建 PPTX。")
-                final_file = build_pptx_from_images(
-                    image_paths=image_paths,
-                    size=size,
-                    output_path=output_file,
-                    log=add_log,
-                    update_progress=lambda done, total: build_progress.progress(
-                        int(done * 100 / total), text=f"建檔進度: {done}/{total}"
-                    ),
+            elif len(artifacts) > 1:
+                zip_bytes = bundle_zip_bytes(artifacts)
+                zip_name = f"drive_batch_{output_format.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                st.download_button(
+                    label="下載批次成果 ZIP",
+                    data=zip_bytes,
+                    file_name=zip_name,
+                    mime="application/zip",
+                    use_container_width=True,
                 )
-
-                pptx_bytes = final_file.read_bytes()
-                artifacts.append((final_file.name, pptx_bytes))
-                success_count += 1
-
-                row.update(
-                    {
-                        "狀態": "成功",
-                        "標題": title,
-                        "輸出檔名": final_file.name,
-                        "頁數": str(resolved_pages),
-                        "尺寸": f"{size[0]} x {size[1]}",
-                        "檔案大小MB": f"{len(pptx_bytes) / 1024 / 1024:.2f}",
-                        "訊息": "完成",
-                    }
-                )
-
-                if save_local:
-                    local_path = Path.cwd() / final_file.name
-                    try:
-                        local_path.write_bytes(pptx_bytes)
-                        add_log(f"已另存至：{local_path}")
-                    except PermissionError:
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        fallback = Path.cwd() / f"{Path(final_file.name).stem}_fixed_{ts}.pptx"
-                        fallback.write_bytes(pptx_bytes)
-                        add_log(f"原檔被占用，已另存為：{fallback}")
-
-            except Exception as err:  # noqa: BLE001
-                row["訊息"] = str(err)
-                add_log(f"[{idx}/{len(links)}] 錯誤：{err}")
-
-            st.session_state.history.append(row)
-
-        if success_count == len(links):
-            status_box.success(f"{operation_name}完成：{success_count}/{len(links)} 成功。")
-        elif success_count > 0:
-            status_box.warning(f"{operation_name}完成：{success_count}/{len(links)} 成功，請檢查失敗項目。")
-        else:
-            status_box.error("作業未完成：全部連結皆失敗。")
-
-        if len(artifacts) == 1:
-            fname, data = artifacts[0]
-            st.download_button(
-                label="下載轉換後 PPTX",
-                data=data,
-                file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                use_container_width=True,
-            )
-        elif len(artifacts) > 1:
-            zip_bytes = bundle_zip_bytes(artifacts)
-            zip_name = f"drive_ppt_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-            st.download_button(
-                label="下載批次成果 ZIP",
-                data=zip_bytes,
-                file_name=zip_name,
-                mime="application/zip",
-                use_container_width=True,
-            )
 
     except Exception as err:  # noqa: BLE001
         status_box.error(f"作業未完成：{err}")
@@ -624,6 +745,10 @@ if st.session_state.history:
         mime="text/csv",
         use_container_width=True,
     )
+
+if st.session_state.link_checks:
+    st.subheader("連結健康檢查結果")
+    st.dataframe(st.session_state.link_checks, use_container_width=True)
 
 with st.expander("作業說明", expanded=False):
     st.markdown(
