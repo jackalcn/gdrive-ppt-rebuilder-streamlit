@@ -1,6 +1,8 @@
 import html
 import io
+import os
 import re
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -15,7 +17,7 @@ from pptx import Presentation
 
 PIXEL_TO_EMU = 9525
 USER_AGENT = "Mozilla/5.0"
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v2026.04.28.1"
 APP_REPO = "jackalcn/gdrive-ppt-rebuilder-streamlit"
 TW_TZ = timezone(timedelta(hours=8))
 
@@ -27,6 +29,30 @@ def get_release_summary() -> tuple[str, str]:
     except OSError:
         updated_text = "未知"
     return APP_VERSION, updated_text
+
+
+def get_deploy_commit_short() -> str:
+    for key in ("STREAMLIT_GIT_COMMIT", "GITHUB_SHA", "COMMIT_SHA"):
+        commit = os.getenv(key, "").strip()
+        if commit:
+            return commit[:7]
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=2,
+        )
+        commit = result.stdout.strip()
+        if commit:
+            return commit
+    except Exception:  # noqa: BLE001
+        pass
+
+    return "未知"
 
 
 def sanitize_filename(name: str) -> str:
@@ -261,6 +287,7 @@ html, body, [class*="css"] { font-family: 'Noto Sans TC', sans-serif; }
 st.title("Google Drive 簡報轉換平台")
 st.caption("專業公務風 | 公開可檢視連結轉換為 PPTX")
 app_version, app_updated_at = get_release_summary()
+deploy_commit = get_deploy_commit_short()
 st.markdown(
     f"<div class='small-note'>版本：{app_version}｜最後更新：{app_updated_at}</div>",
     unsafe_allow_html=True,
@@ -497,3 +524,6 @@ with st.expander("作業說明", expanded=False):
 - 若同名檔案被占用，系統會自動附加 `_fixed_時間戳` 後存檔。
 """
     )
+
+st.markdown("---")
+st.caption(f"部署提交：{deploy_commit}")
